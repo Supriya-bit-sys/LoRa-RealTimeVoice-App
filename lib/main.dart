@@ -26,20 +26,12 @@ const int kJitterPrebufferBytes = 960;
 const int kPlaybackBufferMaxBytes = 4000;
 const int kPlaybackTickMs = 13;
 const int kWavHeaderBytes = 44;
+const int kPttMaxSeconds = 10;
 const int kSenderPostPttWaitMs = 1400;
 const double kReceiverPlaybackGain = 3.0;
 const String kSenderNameKeyword = "heltec_sender";
 const String kReceiverNameKeyword = "heltec_receiver";
 const String kSenderWriteUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
-const int kHeltecCompressedBufferBytes = 4096;
-const int kCodec2CompressedBytesPerFrame = 7;
-const int kCodec2FrameDurationMs = 40;
-const double kPttSafetyHeadroom = 0.65;
-const int kPttWarningBeforeLimitMs = 3000;
-const int kPttLimitBeepLockMs = 3800;
-const int kPttFixedLimitMs = 10000;
-
-final int kComputedPttLimitMs = kPttFixedLimitMs;
 
 _DeviceRole _resolveRoleFromName(String name) {
   final normalized = name.toLowerCase();
@@ -482,7 +474,7 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<Uint8List>? _audioSubscription;
   StreamSubscription<List<int>>? _notifySubscription;
   Timer? _playbackDrainTimer;
-  Timer? _pttLimitTimer;
+   Timer? _pttCountdownTimer;
   Future<void> _receiverPacketChain = Future<void>.value();
 
   BluetoothCharacteristic? _writeCharacteristic;
@@ -494,20 +486,15 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _draining = false;
   bool _playerReady = false;
   bool _receiverStreaming = false;
-  bool _remotePttActive = false;
-  bool _clipsExpanded = false;
+    bool _clipsExpanded = false;
   bool _playbackStarted = false;
   bool _receiverClipFinalizing = false;
-  bool _pttAutoStopInProgress = false;
+  int _pttSecondsRemaining = kPttMaxSeconds;
   int _sequence = 0;
   int _playbackSampleRate = kAudioSampleRate;
   int _currentClipBytes = 0;
-  int _pttRemainingMs = kComputedPttLimitMs;
   String? _activeClipPath;
   String? _playingClipPath;
-  DateTime? _pttStartedAt;
-  DateTime? _pttLockedUntil;
-  bool _pttWarningPlayed = false;
   String _status = 'Connecting...';
 
   @override
@@ -522,7 +509,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _connectionSubscription?.cancel();
     _notifySubscription?.cancel();
     _playbackDrainTimer?.cancel();
-    _pttLimitTimer?.cancel();
+     _pttCountdownTimer?.cancel();
     unawaited(_player.stop());
     unawaited(_clipPlayer.dispose());
     unawaited(_wavRecorder.stop());
@@ -543,8 +530,6 @@ class _ChatScreenState extends State<ChatScreen> {
           _connected = state == BluetoothConnectionState.connected;
           if (!_connected) {
             _streaming = false;
-            _receiverStreaming = false;
-            _remotePttActive = false;
             _writeCharacteristic = null;
             _notifyCharacteristic = null;
             _status = 'Disconnected';
@@ -764,18 +749,7 @@ class _ChatScreenState extends State<ChatScreen> {
         sampleRateKHz > 0 ? sampleRateKHz * 1000 : kAudioSampleRate;
 
     if (packetType == _PacketType.start.code) {
-      if (mounted) {
-        setState(() {
           _receiverStreaming = true;
-          _remotePttActive = true;
-          if (!_streaming) {
-            _status = 'Remote PTT active';
-          }
-        });
-      } else {
-        _receiverStreaming = true;
-        _remotePttActive = true;
-      }
       _playbackStarted = false;
       _playbackBuffer.clear();
       _currentClipBytes = 0;
@@ -785,18 +759,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (packetType == _PacketType.stop.code) {
-      if (mounted) {
-        setState(() {
           _receiverStreaming = false;
-          _remotePttActive = false;
-          if (!_streaming) {
-            _status = _connected ? 'Connected' : 'Disconnected';
-          }
-        });
-      } else {
-        _receiverStreaming = false;
-        _remotePttActive = false;
-      }
       await _finishReceiverClip();
       _appendLog('Incoming voice ended', false);
       return;
@@ -1100,9 +1063,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
       _pcmBuffer.clear();
       _sequence = 0;
-      _pttWarningPlayed = false;
-      _pttStartedAt = DateTime.now();
-      _pttRemainingMs = kComputedPttLimitMs;
 
       await _sendControlPacket(_PacketType.start);
 
@@ -1130,85 +1090,23 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() {
         _streaming = true;
+        _pttSecondsRemaining = kPttMaxSeconds;
         _status = 'Streaming voice';
       });
-      _startPttLimitCountdown();
+      _startPttCountdown();
       _appendLog('PTT started', true);
     } catch (e) {
       _appendLog('PTT start failed: $e', false);
     }
   }
 
-  void _startPttLimitCountdown() {
-    _pttLimitTimer?.cancel();
-    _pttLimitTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-      final startedAt = _pttStartedAt;
-      if (!_streaming || startedAt == null) {
-        return;
-      }
-
-      final elapsed = DateTime.now().difference(startedAt).inMilliseconds;
-      final remaining = (kComputedPttLimitMs - elapsed).clamp(0, kComputedPttLimitMs);
-
-      if (mounted) {
-        setState(() {
-          _pttRemainingMs = remaining;
-        });
-      } else {
-        _pttRemainingMs = remaining;
-      }
-
-      if (!_pttWarningPlayed && remaining <= kPttWarningBeforeLimitMs && remaining > 0) {
-        _pttWarningPlayed = true;
-        unawaited(SystemSound.play(SystemSoundType.click));
-      }
-
-      if (remaining <= 0) {
-        unawaited(_enforcePttLimitStop());
-      }
-    });
-  }
-
-  Future<void> _playLimitBeepAndLock() async {
-    _pttLockedUntil = DateTime.now().add(
-      const Duration(milliseconds: kPttLimitBeepLockMs),
-    );
-    await SystemSound.play(SystemSoundType.alert);
-    await HapticFeedback.heavyImpact();
-    await Future<void>.delayed(
-      const Duration(milliseconds: kPttLimitBeepLockMs),
-    );
-  }
-
-  bool _isPttLocked() {
-    final lockedUntil = _pttLockedUntil;
-    if (lockedUntil == null) {
-      return false;
-    }
-    return DateTime.now().isBefore(lockedUntil);
-  }
-
-  Future<void> _enforcePttLimitStop() async {
-    if (!_streaming || _pttAutoStopInProgress) {
-      return;
-    }
-    _pttAutoStopInProgress = true;
-    try {
-      await _playLimitBeepAndLock();
-      await _stopPtt(autoStoppedByLimit: true);
-    } finally {
-      _pttAutoStopInProgress = false;
-    }
-  }
-
-  Future<void> _stopPtt({bool autoStoppedByLimit = false}) async {
+  Future<void> _stopPtt() async {
     if (!_streaming) {
       return;
     }
 
-    _pttLimitTimer?.cancel();
-    _pttStartedAt = null;
-    _pttRemainingMs = kComputedPttLimitMs;
+    _pttCountdownTimer?.cancel();
+    _pttCountdownTimer = null;
 
     try {
       await _audioSubscription?.cancel();
@@ -1226,19 +1124,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       _streaming = false;
+      _pttSecondsRemaining = kPttMaxSeconds;
       _senderWaitingForSave = true;
-      _status = _connected
-          ? (autoStoppedByLimit
-              ? 'PTT time limit reached. Waiting for save'
-              : 'Waiting for file save')
-          : 'Disconnected';
+      _status = _connected ? 'Waiting for file save' : 'Disconnected';
     });
-    _appendLog(
-      autoStoppedByLimit
-          ? 'PTT auto-stopped at time limit to avoid buffer overflow'
-          : 'PTT stopped',
-      true,
-    );
+    _appendLog('PTT stopped', true);
 
     Future<void>.delayed(const Duration(milliseconds: kSenderPostPttWaitMs))
         .then((_) {
@@ -1247,7 +1137,29 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       setState(() {
         _senderWaitingForSave = false;
+        _pttSecondsRemaining = kPttMaxSeconds;
         _status = _connected ? 'Connected' : 'Disconnected';
+      });
+    });
+  }
+
+  void _startPttCountdown() {
+    _pttCountdownTimer?.cancel();
+    _pttCountdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || !_streaming) {
+        timer.cancel();
+        return;
+      }
+
+      if (_pttSecondsRemaining <= 1) {
+        timer.cancel();
+        _pttCountdownTimer = null;
+        unawaited(_stopPtt());
+        return;
+      }
+
+      setState(() {
+        _pttSecondsRemaining--;
       });
     });
   }
@@ -1372,25 +1284,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isReceivingOrSaving =
-        _receiverStreaming || _remotePttActive || _activeClipPath != null;
-    final pttLocked = _isPttLocked();
+    final isReceivingOrSaving = _receiverStreaming || _activeClipPath != null;
     final canTalk = _connected &&
         !_connecting &&
         !_senderWaitingForSave &&
-        !pttLocked &&
         !isReceivingOrSaving &&
         _writeCharacteristic != null;
-    final remainingSeconds = (_pttRemainingMs / 1000).clamp(0, 999).toStringAsFixed(1);
     final pttLabel = _senderWaitingForSave
         ? 'Wait while file is saving'
-        : pttLocked
-            ? 'Beep active. Please wait...'
-        : isReceivingOrSaving && !_streaming
-            ? 'Other side is talking...'
         : canTalk
             ? (_streaming
-                ? 'Talking... $remainingSeconds s left'
+                ? 'PTT ${_pttSecondsRemaining}s / ${kPttMaxSeconds}s'
                 : 'Tap to start PTT')
             : 'Connecting BLE audio...';
 
@@ -1414,10 +1318,6 @@ class _ChatScreenState extends State<ChatScreen> {
                   const SizedBox(height: 4),
                   Text(
                     'PTT packet: 8-byte header + $kSenderBleAudioPayloadBytes byte PCM payload',
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'PTT talk limit: ${(kComputedPttLimitMs / 1000).toStringAsFixed(1)}s fixed (auto-stop + beep near limit)',
                   ),
                 ],
               ),
@@ -1455,30 +1355,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.only(bottom: 10),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: Colors.amber.shade50,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.amber.shade100),
-                    ),
-                    child: Text(
-                      _streaming
-                          ? 'Speak clearly and stop before timer ends. App will auto-stop at limit.'
-                          : isReceivingOrSaving
-                              ? 'Receiver PTT is locked while the sender is talking.'
-                          : 'Instruction: hold short voice bursts. When beep plays, wait until button is enabled again.',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.amber.shade900,
-                      ),
-                    ),
-                  ),
-                  GestureDetector(
+              child: GestureDetector(
                     onTap: canTalk
                         ? () {
                             if (_streaming) {
@@ -1495,8 +1372,6 @@ class _ChatScreenState extends State<ChatScreen> {
                       decoration: BoxDecoration(
                         color: _senderWaitingForSave
                             ? Colors.amber
-                            : isReceivingOrSaving
-                                ? Colors.grey
                                 : (_streaming ? Colors.red : Colors.green),
                         borderRadius: BorderRadius.circular(24),
                       ),
@@ -1508,12 +1383,9 @@ class _ChatScreenState extends State<ChatScreen> {
                             fontSize: 22,
                             fontWeight: FontWeight.bold,
                           ),
-                          textAlign: TextAlign.center,
                         ),
                       ),
                     ),
-                  ),
-                ],
               ),
             ),
           ],
