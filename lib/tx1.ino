@@ -70,7 +70,7 @@ enum PacketType : uint8_t {
 // LoRa config
 // =====================================================
 #define LORA_FREQ_MHZ  865.1
-#define LORA_BW_KHZ    125.0
+#define LORA_BW_KHZ    250.0
 #define LORA_SF        7
 #define LORA_CR        5
 #define LORA_SYNCWORD  0x12
