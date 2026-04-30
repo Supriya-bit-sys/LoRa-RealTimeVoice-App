@@ -22,7 +22,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // =====================================================
 // Device identity (sender build)
 // =====================================================
-#define DEVICE_BLE_NAME            "Heltec_Reciever"
+#define DEVICE_BLE_NAME            "Heltec_1"
 
 // =====================================================
 // BLE UUIDs and stream protocol

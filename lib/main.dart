@@ -29,17 +29,13 @@ const int kWavHeaderBytes = 44;
 const int kPttMaxSeconds = 10;
 const int kSenderPostPttWaitMs = 1400;
 const double kReceiverPlaybackGain = 3.0;
-const String kSenderNameKeyword = "heltec_sender";
-const String kReceiverNameKeyword = "heltec_receiver";
+const List<String> kTransceiverNameKeywords = ["heltec_1", "heltec_2"];
 const String kSenderWriteUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 
 _DeviceRole _resolveRoleFromName(String name) {
   final normalized = name.toLowerCase();
-  if (normalized.contains(kSenderNameKeyword)) {
-    return _DeviceRole.sender;
-  }
-  if (normalized.contains(kReceiverNameKeyword)) {
-    return _DeviceRole.receiver;
+  if (kTransceiverNameKeywords.any(normalized.contains)) {
+    return _DeviceRole.transceiver;
   }
   return _DeviceRole.unknown;
 }
@@ -315,8 +311,10 @@ class _ScanScreenState extends State<ScanScreen> {
   void _openDeviceScreen(BluetoothDevice device) {
     final role = _resolveRoleFromName(_deviceDisplayName(device));
     final Widget page = switch (role) {
-      _DeviceRole.sender => SenderScreen(device: device),
-      _DeviceRole.receiver => ReceiverScreen(device: device),
+      _DeviceRole.transceiver => ChatScreen(
+          device: device,
+          screenTitle: 'Transceiver',
+        ),
       _DeviceRole.unknown => ChatScreen(device: device),
     };
 
@@ -430,34 +428,6 @@ class ChatScreen extends StatefulWidget {
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
-}
-
-class SenderScreen extends StatelessWidget {
-  const SenderScreen({super.key, required this.device});
-
-  final BluetoothDevice device;
-
-  @override
-  Widget build(BuildContext context) {
-    return ChatScreen(
-      device: device,
-      screenTitle: 'Sender',
-    );
-  }
-}
-
-class ReceiverScreen extends StatelessWidget {
-  const ReceiverScreen({super.key, required this.device});
-
-  final BluetoothDevice device;
-
-  @override
-  Widget build(BuildContext context) {
-    return ChatScreen(
-      device: device,
-      screenTitle: 'Receiver',
-    );
-  }
 }
 
 class _ChatScreenState extends State<ChatScreen> {
@@ -1395,7 +1365,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
-enum _DeviceRole { sender, receiver, unknown }
+enum _DeviceRole { transceiver, unknown }
 
 class _ChatLog {
   const _ChatLog({
